@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tab EQ</title>
+<style>
+  :root{
+    --bg:#dfe3e6; --panel:#f2f4f5; --ink:#14202b; --muted:#5d6b78; --line:#c3cbd1;
+    --accent:#1f4fff; --warn:#b3261e; --screen:#101820; --trace:#ffb000;
+    --font:"Helvetica Neue","Arial Narrow",Arial,sans-serif;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{--bg:#161b20; --panel:#20272e; --ink:#e8edf1; --muted:#93a1ad; --line:#34404a; --accent:#6f8cff; --screen:#0a0f14;}
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--font)}
+  body{min-height:100vh;display:flex;justify-content:center;padding:24px 16px}
+  .rack{width:100%;max-width:980px;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:20px}
+  header{display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;margin-bottom:16px}
+  h1{font-size:22px;font-weight:700;letter-spacing:-.01em;margin:0}
+  .src{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .status{font-size:13px;color:var(--muted);max-width:280px}
+  .status.live{color:var(--accent)}
+  .status.err{color:var(--warn)}
+  button,select{font:inherit;font-size:14px;color:var(--ink);background:var(--panel);border:1px solid var(--ink);border-radius:6px;padding:8px 14px;cursor:pointer}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
+  button:focus-visible,select:focus-visible,input:focus-visible{outline:3px solid var(--accent);outline-offset:2px}
+  button[aria-pressed="true"]{background:var(--ink);color:var(--panel)}
+  .screen{position:relative;background:var(--screen);border-radius:6px;overflow:hidden;margin-bottom:16px}
+  canvas{display:block;width:100%;height:260px}
+  .controls{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin-bottom:12px}
+  .controls label{font-size:13px;color:var(--muted);display:flex;align-items:center;gap:8px}
+  .controls input[type=range]{width:130px;accent-color:var(--accent)}
+  .spacer{flex:1}
+  .bands{display:grid;grid-template-columns:repeat(11,1fr);gap:4px;background:var(--bg);border-radius:6px;padding:14px 6px 10px}
+  .band{display:flex;flex-direction:column;align-items:center;gap:6px}
+  .band output{font-size:12px;font-variant-numeric:tabular-nums;min-height:15px}
+  .band .f{font-size:12px;color:var(--muted)}
+  .band input[type=range]{writing-mode:vertical-lr;direction:rtl;width:28px;height:170px;margin:0;accent-color:var(--accent);cursor:pointer}
+  .band.pre input{accent-color:var(--ink)}
+  .legend{display:flex;justify-content:space-between;font-size:11px;color:var(--muted);margin-top:8px}
+  @media (max-width:640px){
+    .bands{gap:0;padding:12px 2px}
+    .band input[type=range]{width:22px;height:140px}
+    .band .f,.band output{font-size:10px}
+    canvas{height:200px}
+  }
+  @media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+</head>
+<body>
+<main class="rack">
+  <header>
+    <h1>Tab EQ</h1>
+    <div class="src">
+      <button id="pick" class="primary">Choose a tab…</button>
+      <button id="stop" hidden>Stop</button>
+      <span id="status" class="status" role="status">No audio source. Choose a browser tab that is playing sound.</span>
+    </div>
+  </header>
+
+  <div class="screen"><canvas id="scope" aria-label="Spectrum analyzer with EQ curve"></canvas></div>
+
+  <div class="controls">
+    <label>Preset
+      <select id="preset"></select>
+    </label>
+    <button id="bypass" aria-pressed="false">Bypass EQ</button>
+    <button id="reset">Reset</button>
+    <span class="spacer"></span>
+    <label>Volume <input id="vol" type="range" min="0" max="1.5" step="0.01" value="1"></label>
+  </div>
+
+  <div class="bands" id="bands"></div>
+  <div class="legend"><span>+12 dB</span><span>0 dB centre line</span><span>−12 dB</span></div>
+</main>
+
+<script>
+(() => {
+  const FREQS = [31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
+  const PRESETS = {
+    "Flat":          [0,0,0,0,0,0,0,0,0,0],
+    "Bass boost":    [7,6,4,2,0,0,0,0,0,0],
+    "Treble boost":  [0,0,0,0,0,1,3,5,6,7],
+    "Vocal":         [-3,-2,-1,1,3,4,3,1,0,-1],
+    "Loudness":      [6,4,1,0,-1,-1,0,2,4,5],
+    "Rock":          [5,4,2,-1,-2,-1,2,4,5,5],
+    "Electronic":    [6,5,1,-1,-2,2,1,2,5,6],
+    "Acoustic":      [4,3,2,1,1,1,2,3,3,2],
+    "Podcast":       [-6,-4,-1,2,3,4,3,1,-2,-4]
+  };
+
+  const $ = id => document.getElementById(id);
+  const statusEl = $("status"), pickBtn = $("pick"), stopBtn = $("stop");
+  const bandsEl = $("bands"), presetSel = $("preset"), bypassBtn = $("bypass");
+
+  let ctx, source, stream, filters = [], preamp, master, analyser, bypassed = false;
+  const gains = new Array(10).fill(0);
+  let preGain = 0;
+
+  const label = f => f >= 1000 ? (f / 1000) + "k" : String(f);
+  const fmt = v => (v > 0 ? "+" : v < 0 ? "−" : "") + Math.abs(v).toFixed(0);
+
+  function setStatus(msg, cls = "") { statusEl.textContent = msg; statusEl.className = "status " + cls; }
+
+  // ----- UI -----
+  const sliders = [];
+  const outs = [];
+  function makeBand(name, cls, onInput) {
+    const d = document.createElement("div");
+    d.className = "band " + cls;
+    const out = document.createElement("output");
+    out.textContent = "0";
+    const s = document.createElement("input");
+    s.type = "range"; s.min = -12; s.max = 12; s.step = 0.5; s.value = 0;
+    s.setAttribute("aria-label", name);
+    s.addEventListener("input", () => onInput(parseFloat(s.value)));
+    s.addEventListener("dblclick", () => { s.value = 0; onInput(0); });
+    const f = document.createElement("span");
+    f.className = "f"; f.textContent = name;
+    d.append(out, s, f);
+    bandsEl.appendChild(d);
+    return { s, out };
+  }
+
+  const pre = makeBand("Pre", "pre", v => { preGain = v; pre.out.textContent = fmt(v); applyAudio(); });
+  FREQS.forEach((f, i) => {
+    const b = makeBand(label(f), "", v => { gains[i] = v; b.out.textContent = fmt(v); applyAudio(); });
+    sliders.push(b.s); outs.push(b.out);
+  });
+
+  Object.keys(PRESETS).forEach(n => presetSel.add(new Option(n, n)));
+  presetSel.addEventListener("change", () => loadPreset(presetSel.value));
+
+  function loadPreset(name) {
+    PRESETS[name].forEach((v, i) => { gains[i] = v; sliders[i].value = v; outs[i].textContent = fmt(v); });
+    applyAudio();
+  }
+  $("reset").addEventListener("click", () => {
+    presetSel.value = "Flat"; loadPreset("Flat");
+    preGain = 0; pre.s.value = 0; pre.out.textContent = "0"; applyAudio();
+  });
+  bypassBtn.addEventListener("click", () => {
+    bypassed = !bypassed;
+    bypassBtn.setAttribute("aria-pressed", bypassed);
+    applyAudio();
+  });
+  $("vol").addEventListener("input", e => { if (master) master.gain.value = parseFloat(e.target.value); });
+
+  // ----- Audio -----
+  function buildGraph() {
+    ctx = ctx || new (window.AudioContext || window.webkitAudioContext)();
+    preamp = ctx.createGain();
+    master = ctx.createGain();
+    master.gain.value = parseFloat($("vol").value);
+    analyser = ctx.createAnalyser();
+    analyser.fftSize = 4096;
+    analyser.smoothingTimeConstant = 0.82;
+
+    filters = FREQS.map((f, i) => {
+      const n = ctx.createBiquadFilter();
+      n.type = i === 0 ? "lowshelf" : i === FREQS.length - 1 ? "highshelf" : "peaking";
+      n.frequency.value = f;
+      n.Q.value = 1.1;
+      return n;
+    });
+    // chain: preamp -> filters -> master -> analyser -> out
+    let prev = preamp;
+    filters.forEach(n => { prev.connect(n); prev = n; });
+    prev.connect(master);
+    master.connect(analyser);
+    analyser.connect(ctx.destination);
+    applyAudio();
+  }
+
+  function applyAudio() {
+    drawCurveCache = null;
+    if (!filters.length) return;
+    filters.forEach((n, i) => { n.gain.value = bypassed ? 0 : gains[i]; });
+    preamp.gain.value = bypassed ? 1 : Math.pow(10, preGain / 20);
+  }
+
+  async function pickTab() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+      setStatus("This browser cannot capture tab audio. Use Chrome or Edge on desktop.", "err");
+      return;
+    }
+    try {
+      const s = await navigator.mediaDevices.getDisplayMedia({
+        video: true,
+        audio: { suppressLocalAudioPlayback: true, echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+        preferCurrentTab: false,
+        selfBrowserSurface: "exclude",
+        systemAudio: "exclude",
+        surfaceSwitching: "include"
+      });
+      if (!s.getAudioTracks().length) {
+        s.getTracks().forEach(t => t.stop());
+        setStatus("That tab shared no audio. Pick a tab and tick “Share tab audio”.", "err");
+        return;
+      }
+      stopCapture(true);
+      stream = s;
+      s.getVideoTracks().forEach(t => t.stop()); // audio only
+      buildGraph();
+      if (ctx.state === "suspended") await ctx.resume();
+      source = ctx.createMediaStreamSource(new MediaStream(s.getAudioTracks()));
+      source.connect(preamp);
+      s.getAudioTracks()[0].addEventListener("ended", () => stopCapture());
+      pickBtn.textContent = "Change tab…";
+      stopBtn.hidden = false;
+      setStatus("Live: audio from the chosen tab now plays through the EQ.", "live");
+    } catch (e) {
+      setStatus(e.name === "NotAllowedError" ? "Tab selection was cancelled." : "Capture failed: " + e.message, "err");
+    }
+  }
+
+  function stopCapture(silent) {
+    if (stream) stream.getTracks().forEach(t => t.stop());
+    if (source) { try { source.disconnect(); } catch (_) {} }
+    stream = source = null;
+    if (ctx && ctx.state === "running") { ctx.close(); ctx = null; filters = []; analyser = null; }
+    pickBtn.textContent = "Choose a tab…";
+    stopBtn.hidden = true;
+    if (!silent) setStatus("Stopped. Choose a tab to start again.");
+  }
+  pickBtn.addEventListener("click", pickTab);
+  stopBtn.addEventListener("click", () => stopCapture());
+
+  // ----- Drawing -----
+  const cv = $("scope"), g = cv.getContext("2d");
+  let W = 0, H = 0, dpr = 1, drawCurveCache = null;
+  const FMIN = 20, FMAX = 20000;
+  const xOf = f => (Math.log(f / FMIN) / Math.log(FMAX / FMIN)) * W;
+  const yOf = db => H / 2 - (db / 12) * (H / 2 - 18);
+
+  function resize() {
+    dpr = window.devicePixelRatio || 1;
+    W = cv.clientWidth; H = cv.clientHeight;
+    cv.width = W * dpr; cv.height = H * dpr;
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    drawCurveCache = null;
+  }
+  addEventListener("resize", resize);
+
+  function responseCurve() {
+    // Response from the sliders themselves so the curve shows even with no audio.
+    const n = 240, freqs = new Float32Array(n), total = new Float32Array(n).fill(1);
+    for (let i = 0; i < n; i++) freqs[i] = FMIN * Math.pow(FMAX / FMIN, i / (n - 1));
+    const tmp = ctx || new OfflineAudioContext(1, 1, 44100);
+    const mag = new Float32Array(n), ph = new Float32Array(n);
+    const nodes = filters.length ? filters : FREQS.map((f, i) => {
+      const b = tmp.createBiquadFilter();
+      b.type = i === 0 ? "lowshelf" : i === FREQS.length - 1 ? "highshelf" : "peaking";
+      b.frequency.value = f; b.Q.value = 1.1; b.gain.value = bypassed ? 0 : gains[i];
+      return b;
+    });
+    nodes.forEach(nd => {
+      nd.getFrequencyResponse(freqs, mag, ph);
+      for (let i = 0; i < n; i++) total[i] *= mag[i];
+    });
+    const pg = bypassed ? 0 : preGain;
+    return { freqs, db: Array.from(total, v => 20 * Math.log10(v) + pg) };
+  }
+
+  function draw() {
+    requestAnimationFrame(draw);
+    if (!W) resize();
+    const css = getComputedStyle(document.documentElement);
+    const trace = css.getPropertyValue("--trace").trim();
+    g.clearRect(0, 0, W, H);
+
+    // grid
+    g.lineWidth = 1; g.font = "11px " + css.getPropertyValue("--font");
+    g.fillStyle = "#8795a1"; g.strokeStyle = "rgba(255,255,255,.08)";
+    [20,50,100,200,500,1000,2000,5000,10000,20000].forEach(f => {
+      const x = Math.round(xOf(f)) + .5;
+      g.beginPath(); g.moveTo(x, 0); g.lineTo(x, H); g.stroke();
+      g.fillText(f >= 1000 ? f / 1000 + "k" : f, Math.min(x + 3, W - 24), H - 5);
+    });
+    [-12,-6,0,6,12].forEach(db => {
+      const y = Math.round(yOf(db)) + .5;
+      g.strokeStyle = db === 0 ? "rgba(255,255,255,.28)" : "rgba(255,255,255,.08)";
+      g.beginPath(); g.moveTo(0, y); g.lineTo(W, y); g.stroke();
+      g.fillText((db > 0 ? "+" : "") + db, 4, y - 3);
+    });
+
+    // spectrum
+    if (analyser) {
+      const bins = new Uint8Array(analyser.frequencyBinCount);
+      analyser.getByteFrequencyData(bins);
+      const nyq = ctx.sampleRate / 2;
+      g.fillStyle = "rgba(255,176,0,.35)";
+      g.beginPath(); g.moveTo(0, H);
+      for (let x = 0; x <= W; x += 2) {
+        const f = FMIN * Math.pow(FMAX / FMIN, x / W);
+        const idx = Math.min(bins.length - 1, Math.round(f / nyq * bins.length));
+        g.lineTo(x, H - (bins[idx] / 255) * (H - 20));
+      }
+      g.lineTo(W, H); g.closePath(); g.fill();
+    }
+
+    // EQ curve
+    const { freqs, db } = responseCurve();
+    g.strokeStyle = "#ffffff"; g.lineWidth = 2.5; g.beginPath();
+    freqs.forEach((f, i) => {
+      const x = xOf(f), y = yOf(Math.max(-14, Math.min(14, db[i])));
+      i ? g.lineTo(x, y) : g.moveTo(x, y);
+    });
+    g.stroke();
+
+    // band handles
+    g.fillStyle = trace;
+    FREQS.forEach((f, i) => {
+      g.beginPath(); g.arc(xOf(f), yOf(bypassed ? 0 : gains[i]), 4, 0, 6.283); g.fill();
+    });
+  }
+  resize(); draw();
+})();
+</script>
+</body>
+</html>
