@@ -1,0 +1,3 @@
+- Route and isolate audio streams directly in the browser using the Web Audio API.
+- Real-Time EQ & Filtering: Custom gain and frequency adjustments for fine-tuning sound.
+- Runs natively in the browser without external libraries or extensions.
